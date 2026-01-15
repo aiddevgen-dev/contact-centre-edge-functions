@@ -45,7 +45,7 @@ serve(async (req) => {
         }]
       }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
-
+// sasa
     // Normalize phone number
     let normalizedPhone = phoneNumber.replace(/\D/g, '');
     if (normalizedPhone.length === 11 && normalizedPhone.startsWith('1')) {
@@ -112,4 +112,5 @@ serve(async (req) => {
       }]
     }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
-});
+
+  

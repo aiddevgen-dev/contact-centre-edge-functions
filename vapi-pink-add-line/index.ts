@@ -17,9 +17,6 @@ const PRICING = {
   tablet: 10,
 };
 
-// Demo session storage (in production, use database)
-const sessionState: Record<string, any> = {};
-
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
@@ -34,6 +31,7 @@ serve(async (req) => {
     const { message = {} } = body;
     const toolCall = message?.toolCalls?.[0] || message?.tool_calls?.[0];
     const functionArgs = toolCall?.function?.arguments || body.arguments || {};
+    const toolCallId = toolCall?.id || 'unknown';
 
     const customerId = functionArgs?.customerId ||
                       functionArgs?.customer_id ||
@@ -59,86 +57,107 @@ serve(async (req) => {
 
     if (!customerId) {
       return new Response(JSON.stringify({
-        success: false,
-        message: "I need to verify your account first before adding a new line. What's the phone number on your account?"
+        results: [{
+          toolCallId,
+          result: JSON.stringify({
+            success: false,
+            message: "I need to verify your account first before adding a new line. What's the phone number on your account?"
+          })
+        }]
       }), {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
 
-    // Validate line type
-    const validLineTypes = ['phone', 'tablet', 'iphone', 'ipad'];
+    // Normalize line type
     const normalizedLineType = lineType.includes('tablet') || lineType.includes('ipad') ? 'tablet' : 'phone';
     const monthlyPrice = PRICING[normalizedLineType as keyof typeof PRICING];
 
-    // Generate new line details
-    const newLineId = `line_${Date.now()}`;
-    const newPhoneNumber = `+1-555-${Math.floor(1000 + Math.random() * 9000)}`;
+    const device = deviceType || (normalizedLineType === 'phone' ? 'iPhone' : 'iPad');
 
-    const newLine = {
-      id: newLineId,
-      type: normalizedLineType,
-      device: deviceType || (normalizedLineType === 'phone' ? 'iPhone' : 'iPad'),
-      number: newPhoneNumber,
-      monthlyPrice,
-      status: 'pending_activation',
-      addedAt: new Date().toISOString(),
-    };
-
-    // Store in session state
-    if (!sessionState[customerId]) {
-      sessionState[customerId] = { pendingLines: [], appliedPromos: [] };
-    }
-
+    // Insert line(s) into pink_lines table
+    const linesToInsert = [];
     for (let i = 0; i < quantity; i++) {
-      const line = { ...newLine, id: `${newLineId}_${i}` };
-      sessionState[customerId].pendingLines.push(line);
+      linesToInsert.push({
+        id: `line_${Date.now()}_${i}`,
+        customer_id: customerId,
+        line_type: normalizedLineType,
+        device: device,
+        phone_number: `+1-555-${Math.floor(1000 + Math.random() * 9000)}`,
+        monthly_price: monthlyPrice,
+      });
     }
 
-    const totalNewLines = sessionState[customerId].pendingLines.length;
-    const totalNewMonthly = sessionState[customerId].pendingLines.reduce(
-      (sum: number, l: any) => sum + l.monthlyPrice,
-      0
-    );
+    const { data: insertedLines, error: insertError } = await supabase
+      .from('pink_lines')
+      .insert(linesToInsert)
+      .select();
 
-    // Try to log to database
+    if (insertError) {
+      console.error('Error inserting lines:', insertError);
+      return new Response(JSON.stringify({
+        results: [{
+          toolCallId,
+          result: JSON.stringify({
+            success: false,
+            message: "I'm having trouble adding the line right now. Please try again."
+          })
+        }]
+      }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    // Get updated line count for this customer
+    const { data: allLines } = await supabase
+      .from('pink_lines')
+      .select('monthly_price')
+      .eq('customer_id', customerId);
+
+    const totalLines = allLines?.length || 0;
+    const totalMonthlyBill = allLines?.reduce((sum: number, l: any) => sum + (parseFloat(l.monthly_price) || 0), 0) || 0;
+    const linesNeeded = 5 - totalLines;
+
+    // Check if eligible for 5-line promo
+    let promoMessage = "";
+    if (totalLines >= 5) {
+      promoMessage = " Great news - you now qualify for the FREE iPad promotion!";
+    } else if (linesNeeded > 0 && linesNeeded <= 2) {
+      promoMessage = ` Add ${linesNeeded} more line${linesNeeded > 1 ? 's' : ''} to get a FREE iPad!`;
+    }
+
+    // Log to ai_actions
     try {
       await supabase.from('ai_actions').insert({
         session_id: customerId,
         action_type: 'add_line',
-        details: {
-          lineType: normalizedLineType,
-          device: newLine.device,
-          quantity,
-          monthlyPrice,
-        },
+        details: { lineType: normalizedLineType, device, quantity, monthlyPrice },
         timestamp: new Date().toISOString(),
       });
     } catch (e) {
       console.log('Could not log to ai_actions:', e);
     }
 
-    // Check if eligible for 5-line promo after adding
-    // This would need current line count from account info
-    const promoMessage = totalNewLines >= 2
-      ? " With this addition, you may qualify for our 5-Line Free iPad promotion!"
-      : "";
-
-    const deviceName = quantity > 1 ? `${quantity} new ${newLine.device} lines` : `a new ${newLine.device} line`;
+    const deviceName = quantity > 1 ? `${quantity} new ${device} lines` : `a new ${device} line`;
 
     return new Response(JSON.stringify({
-      success: true,
-      lineAdded: true,
-      line: newLine,
-      pendingLines: sessionState[customerId].pendingLines,
-      totalPendingLines: totalNewLines,
-      totalNewMonthlyCharge: totalNewMonthly,
-      pricing: {
-        lineType: normalizedLineType,
-        monthlyPrice,
-        totalForNewLines: totalNewMonthly,
-      },
-      message: `I've added ${deviceName} to your account. The ${normalizedLineType} line is ${monthlyPrice} dollars per month.${promoMessage} Would you like to add anything else?`
+      results: [{
+        toolCallId,
+        result: JSON.stringify({
+          success: true,
+          lineAdded: true,
+          linesAdded: insertedLines,
+          totalLines,
+          totalMonthlyBill,
+          pricing: {
+            lineType: normalizedLineType,
+            monthlyPrice,
+            totalForNewLines: quantity * monthlyPrice,
+          },
+          message: `I've added ${deviceName} to your account. The ${normalizedLineType} line is ${monthlyPrice} dollars per month. You now have ${totalLines} total lines.${promoMessage}`
+        })
+      }]
     }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
@@ -146,9 +165,14 @@ serve(async (req) => {
   } catch (error) {
     console.error('Error in vapi-pink-add-line:', error);
     return new Response(JSON.stringify({
-      success: false,
-      error: 'Failed to add line',
-      message: "I'm having trouble adding the line right now. Please try again."
+      results: [{
+        toolCallId: 'unknown',
+        result: JSON.stringify({
+          success: false,
+          error: 'Failed to add line',
+          message: "I'm having trouble adding the line right now. Please try again."
+        })
+      }]
     }), {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }

@@ -20,8 +20,8 @@ serve(async (req)=>{
       throw new Error('Call ID is required');
     }
     console.log('Ending call:', callId);
-    // Get the call record to find the Twilio Call SID
-    const { data: callRecord, error: callError } = await supabase.from('calls').select('twilio_call_sid, call_status').eq('id', callId).single();
+    // Get the call record to find the Twilio Call SID and started_at for duration calc
+    const { data: callRecord, error: callError } = await supabase.from('calls').select('twilio_call_sid, call_status, started_at, customer_number, agent_id').eq('id', callId).single();
     if (callError || !callRecord) {
       throw new Error('Call record not found');
     }
@@ -46,16 +46,37 @@ serve(async (req)=>{
       // Continue to update our database even if Twilio call couldn't be ended
       }
     }
+    // Calculate call duration
+    const endedAt = new Date();
+    let callDuration = 0;
+    if (callRecord.started_at) {
+      const startedAt = new Date(callRecord.started_at);
+      callDuration = Math.round((endedAt.getTime() - startedAt.getTime()) / 1000); // duration in seconds
+    }
+
+    // Get transcript for this call
+    const { data: transcripts } = await supabase
+      .from('transcripts')
+      .select('speaker, text')
+      .eq('call_id', callId)
+      .order('created_at', { ascending: true });
+
+    // Combine transcripts into notes
+    const notes = transcripts?.map(t => `${t.speaker}: ${t.text}`).join('\n') || '';
+
     // Update the call record in our database
     const { error: updateError } = await supabase.from('calls').update({
       call_status: 'completed',
-      ended_at: new Date().toISOString()
+      ended_at: endedAt.toISOString(),
+      call_duration: callDuration,
+      resolution_status: 'resolved',
+      notes: notes || null
     }).eq('id', callId);
     if (updateError) {
       console.error('Error updating call record:', updateError);
       throw updateError;
     }
-    console.log('Call ended successfully');
+    console.log('Call ended successfully. Duration:', callDuration, 'seconds');
     return new Response(JSON.stringify({
       success: true,
       message: 'Call ended successfully'
